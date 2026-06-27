@@ -22,7 +22,11 @@ pub(crate) fn link_spans(text: &str, plain_style: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut rest = text;
 
-    while let Some(start) = find_url_start(rest) {
+    while let Some(start) = [rest.find("http://"), rest.find("https://")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
         if start > 0 {
             spans.push(Span::styled(rest[..start].to_string(), plain_style));
         }
@@ -46,15 +50,6 @@ pub(crate) fn link_spans(text: &str, plain_style: Style) -> Vec<Span<'static>> {
     }
 
     spans
-}
-
-pub(crate) fn find_url_start(text: &str) -> Option<usize> {
-    match (text.find("http://"), text.find("https://")) {
-        (Some(http), Some(https)) => Some(http.min(https)),
-        (Some(http), None) => Some(http),
-        (None, Some(https)) => Some(https),
-        (None, None) => None,
-    }
 }
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
@@ -244,14 +239,16 @@ pub(crate) fn comment_separator_for(previous_depth: usize, depth: usize) -> Opti
     }
 }
 
+pub(crate) type CommentLine = (String, Option<usize>);
+
 pub(crate) fn comment_descendant_count(comments: &[Comment], index: usize) -> usize {
     let Some(comment) = comments.get(index) else {
         return 0;
     };
     comments[index + 1..]
         .iter()
-        .take_while(|child| child.depth > comment.depth)
-        .count()
+        .position(|child| child.depth <= comment.depth)
+        .unwrap_or(comments.len() - index - 1)
 }
 
 pub(crate) fn visible_comment_indices(
@@ -279,15 +276,13 @@ pub(crate) fn comment_text_lines(
     collapsed: &HashSet<usize>,
     selected: Option<usize>,
     width: usize,
-) -> (Vec<String>, Vec<Option<usize>>) {
+) -> Vec<CommentLine> {
     let width = width.max(1);
     let mut lines = Vec::new();
-    let mut owners = Vec::new();
 
     if comments.is_empty() {
-        lines.push("No comments.".to_string());
-        owners.push(None);
-        return (lines, owners);
+        lines.push(("No comments.".to_string(), None));
+        return lines;
     }
 
     let mut index = 0;
@@ -297,8 +292,7 @@ pub(crate) fn comment_text_lines(
         if let Some(last_depth) = last_visible_depth
             && let Some(separator) = comment_separator_for(last_depth, comment.depth)
         {
-            lines.push(separator);
-            owners.push(None);
+            lines.push((separator, None));
         }
 
         let hidden = comment_descendant_count(comments, index);
@@ -315,24 +309,10 @@ pub(crate) fn comment_text_lines(
         } else {
             comment.author.clone()
         };
-        push_wrapped_lines(
-            &mut lines,
-            &mut owners,
-            Some(index),
-            &author_prefix,
-            &author,
-            width,
-        );
+        push_wrapped_lines(&mut lines, Some(index), &author_prefix, &author, width);
         if !is_collapsed {
             let text = clean_comment_text(&comment.text);
-            push_wrapped_lines(
-                &mut lines,
-                &mut owners,
-                Some(index),
-                &text_prefix,
-                &text,
-                width,
-            );
+            push_wrapped_lines(&mut lines, Some(index), &text_prefix, &text, width);
         }
         if is_collapsed {
             let collapsed_text = if hidden == 0 {
@@ -342,7 +322,6 @@ pub(crate) fn comment_text_lines(
             };
             push_wrapped_lines(
                 &mut lines,
-                &mut owners,
                 Some(index),
                 &text_prefix,
                 &collapsed_text,
@@ -356,12 +335,11 @@ pub(crate) fn comment_text_lines(
         }
     }
 
-    (lines, owners)
+    lines
 }
 
 pub(crate) fn push_wrapped_lines(
-    lines: &mut Vec<String>,
-    owners: &mut Vec<Option<usize>>,
+    lines: &mut Vec<CommentLine>,
     owner: Option<usize>,
     prefix: &str,
     text: &str,
@@ -372,16 +350,14 @@ pub(crate) fn push_wrapped_lines(
     for raw in text.lines() {
         let mut rest = raw.trim_end();
         if rest.is_empty() {
-            lines.push(prefix.to_string());
-            owners.push(owner);
+            lines.push((prefix.to_string(), owner));
             continue;
         }
 
         while rest.chars().count() > available {
             let split = split_at_width(rest, available);
             let (head, tail) = rest.split_at(split);
-            lines.push(format!("{prefix}{}", head.trim_end()));
-            owners.push(owner);
+            lines.push((format!("{prefix}{}", head.trim_end()), owner));
             rest = tail.trim_start();
             if rest.is_empty() {
                 break;
@@ -389,8 +365,7 @@ pub(crate) fn push_wrapped_lines(
         }
 
         if !rest.is_empty() {
-            lines.push(format!("{prefix}{rest}"));
-            owners.push(owner);
+            lines.push((format!("{prefix}{rest}"), owner));
         }
     }
 }
@@ -439,136 +414,122 @@ pub(crate) fn split_at_char_count(text: &str, count: usize) -> (&str, &str) {
     }
 }
 
-pub(crate) fn deselected_comment_header_line(line: &str, comment: &Comment) -> Line<'static> {
-    let (prefix, author) = split_at_char_count(line, comment.depth * 3);
-    let mut spans = Vec::new();
-    if !prefix.is_empty() {
-        spans.push(Span::styled(
-            prefix.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    spans.push(Span::styled(
-        author.to_string(),
-        Style::default().fg(author_color(&comment.author)),
-    ));
-    Line::from(spans)
-}
-
-pub(crate) fn deselected_comment_body_line(line: &str, depth: usize) -> Line<'static> {
-    let (prefix, body) = split_at_char_count(line, if depth == 0 { 2 } else { depth * 3 });
-    let mut spans = Vec::new();
-    if !prefix.is_empty() {
-        spans.push(Span::styled(
-            prefix.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    spans.extend(link_spans(body, Style::default().fg(Color::Gray)));
-    Line::from(spans)
-}
-
-pub(crate) fn selected_comment_line(
+pub(crate) fn comment_line(
     line: &str,
-    depth: usize,
+    owner: Option<usize>,
+    comments: &[Comment],
+    selected: Option<usize>,
     is_comment_header: bool,
 ) -> Line<'static> {
-    let selected_style = Style::default()
-        .fg(Color::Rgb(255, 255, 0))
-        .add_modifier(Modifier::BOLD);
-    let ancestor_style = Style::default().fg(Color::DarkGray);
+    let Some(index) = owner else {
+        return Line::styled(line.to_string(), Style::default().fg(Color::DarkGray));
+    };
+    let Some(comment) = comments.get(index) else {
+        return Line::styled(line.to_string(), Style::default().fg(Color::Gray));
+    };
+    let rail_style = Style::default().fg(Color::DarkGray);
     let text_style = Style::default().fg(Color::Gray);
 
+    if selected == Some(index) {
+        let selected_style = Style::default()
+            .fg(Color::Rgb(255, 255, 0))
+            .add_modifier(Modifier::BOLD);
+        if is_comment_header {
+            let ancestor = "│  ".repeat(comment.depth.saturating_sub(1));
+            let closest = if comment.depth == 0 {
+                "▶ "
+            } else {
+                "▶─ "
+            };
+            let prefix = format!("{ancestor}{closest}");
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                let mut spans = Vec::new();
+                if !ancestor.is_empty() {
+                    spans.push(Span::styled(ancestor, rail_style));
+                }
+                spans.push(Span::styled(closest.to_string(), selected_style));
+                spans.push(Span::styled(rest.to_string(), selected_style));
+                return Line::from(spans);
+            }
+
+            return Line::styled(line.to_string(), selected_style);
+        }
+
+        if comment.depth > 0 {
+            let ancestor = "│  ".repeat(comment.depth - 1);
+            let closest = "│  ";
+            let prefix = format!("{ancestor}{closest}");
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                let mut spans = Vec::new();
+                if !ancestor.is_empty() {
+                    spans.push(Span::styled(ancestor, rail_style));
+                }
+                spans.push(Span::styled(closest.to_string(), selected_style));
+                spans.extend(link_spans(rest, text_style));
+                return Line::from(spans);
+            }
+        }
+
+        return Line::from(link_spans(line, text_style));
+    }
+
+    let split = if is_comment_header || comment.depth > 0 {
+        comment.depth * 3
+    } else {
+        2
+    };
+    let (prefix, body) = split_at_char_count(line, split);
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_string(), rail_style));
+    }
     if is_comment_header {
-        let ancestor = "│  ".repeat(depth.saturating_sub(1));
-        let closest = if depth == 0 { "▶ " } else { "▶─ " };
-        let prefix = format!("{ancestor}{closest}");
-        if let Some(rest) = line.strip_prefix(&prefix) {
-            let mut spans = Vec::new();
-            if !ancestor.is_empty() {
-                spans.push(Span::styled(ancestor, ancestor_style));
-            }
-            spans.push(Span::styled(closest.to_string(), selected_style));
-            spans.push(Span::styled(rest.to_string(), selected_style));
-            return Line::from(spans);
-        }
-
-        return Line::styled(line.to_string(), selected_style);
+        spans.push(Span::styled(
+            body.to_string(),
+            Style::default().fg(author_color(&comment.author)),
+        ));
+    } else {
+        spans.extend(link_spans(body, text_style));
     }
-
-    if depth > 0 {
-        let ancestor = "│  ".repeat(depth - 1);
-        let closest = "│  ";
-        let prefix = format!("{ancestor}{closest}");
-        if let Some(rest) = line.strip_prefix(&prefix) {
-            let mut spans = Vec::new();
-            if !ancestor.is_empty() {
-                spans.push(Span::styled(ancestor, ancestor_style));
-            }
-            spans.push(Span::styled(closest.to_string(), selected_style));
-            spans.extend(link_spans(rest, text_style));
-            return Line::from(spans);
-        }
-    }
-
-    Line::from(link_spans(line, text_style))
+    Line::from(spans)
 }
 
 pub(crate) fn comment_lines_text(
-    lines: &[String],
-    owners: &[Option<usize>],
+    lines: &[CommentLine],
     comments: &[Comment],
     selected: Option<usize>,
 ) -> Text<'static> {
     Text::from(
         lines
             .iter()
-            .zip(owners.iter())
             .enumerate()
             .map(|(line_index, (line, owner))| {
-                let is_comment_header = owner.is_some()
-                    && line_index.checked_sub(1).and_then(|i| owners.get(i)) != Some(owner);
-                if *owner == selected {
-                    let depth = owner
-                        .and_then(|index| comments.get(index))
-                        .map_or(0, |comment| comment.depth);
-                    selected_comment_line(line, depth, is_comment_header)
-                } else if let (Some(index), true) = (*owner, is_comment_header) {
-                    comments.get(index).map_or_else(
-                        || Line::styled(line.clone(), Style::default().fg(Color::Gray)),
-                        |comment| deselected_comment_header_line(line, comment),
-                    )
-                } else if let Some(index) = *owner {
-                    comments.get(index).map_or_else(
-                        || Line::styled(line.clone(), Style::default().fg(Color::Gray)),
-                        |comment| deselected_comment_body_line(line, comment.depth),
-                    )
-                } else {
-                    Line::styled(line.clone(), Style::default().fg(Color::DarkGray))
-                }
+                let owner = *owner;
+                let previous_owner = line_index
+                    .checked_sub(1)
+                    .and_then(|i| lines.get(i))
+                    .and_then(|(_, owner)| *owner);
+                let is_comment_header = owner.is_some() && previous_owner != owner;
+                comment_line(line, owner, comments, selected, is_comment_header)
             })
             .collect::<Vec<_>>(),
     )
 }
 
-pub(crate) fn owner_line_range(owners: &[Option<usize>], owner: usize) -> Option<(usize, usize)> {
-    let first = owners
-        .iter()
-        .position(|&line_owner| line_owner == Some(owner))?;
-    let last = owners
-        .iter()
-        .rposition(|&line_owner| line_owner == Some(owner))?;
+pub(crate) fn owner_line_range(lines: &[CommentLine], owner: usize) -> Option<(usize, usize)> {
+    let first = lines.iter().position(|line| line.1 == Some(owner))?;
+    let last = lines.iter().rposition(|line| line.1 == Some(owner))?;
     Some((first, last))
 }
 
 pub(crate) fn scroll_to_show_comment(
-    owners: &[Option<usize>],
+    lines: &[CommentLine],
     selected: usize,
     current_scroll: usize,
     viewport_height: usize,
     max_scroll: usize,
 ) -> usize {
-    let Some((first, last)) = owner_line_range(owners, selected) else {
+    let Some((first, last)) = owner_line_range(lines, selected) else {
         return current_scroll.min(max_scroll);
     };
     let viewport_height = viewport_height.max(1);
@@ -596,7 +557,7 @@ pub(crate) fn render_comments(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let inner_width = comments_area.width.saturating_sub(2) as usize;
     let inner_height = (comments_area.height.saturating_sub(2) as usize).max(1);
-    let (lines, owners) = comment_text_lines(
+    let lines = comment_text_lines(
         &app.comments,
         &app.collapsed_comments,
         Some(app.comment_selected),
@@ -606,7 +567,7 @@ pub(crate) fn render_comments(frame: &mut Frame, app: &mut App, area: Rect) {
     app.comment_scroll = app.comment_scroll.min(app.comment_max_scroll);
     if app.comment_keep_selection_visible {
         app.comment_scroll = scroll_to_show_comment(
-            &owners,
+            &lines,
             app.comment_selected,
             app.comment_scroll,
             inner_height,
@@ -628,7 +589,6 @@ pub(crate) fn render_comments(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(comment_lines_text(
             &lines,
-            &owners,
             &app.comments,
             Some(app.comment_selected),
         ))

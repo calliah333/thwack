@@ -219,15 +219,6 @@ impl App {
         self.open_url(url);
     }
 
-    pub(crate) fn open_discussion(&mut self) {
-        let url = self.selected_post().map(|post| post.discussion_url.clone());
-        self.open_url(url);
-    }
-
-    pub(crate) fn back_to_posts(&mut self) {
-        self.mode = Mode::Posts;
-    }
-
     pub(crate) fn open_url(&mut self, url: Option<String>) {
         let Some(url) = url else {
             self.status = "No link selected".to_string();

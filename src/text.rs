@@ -11,11 +11,12 @@ pub(crate) fn html_to_text(html: &str) -> String {
                     out.push_str(&entity);
                 }
                 in_tag = true;
-                out.push(if starts_html_break_tag(&html[index..]) {
-                    '\n'
+                if starts_html_break_tag(&html[index..]) {
+                    out.push('\n');
+                    out.push('\n');
                 } else {
-                    ' '
-                });
+                    out.push(' ');
+                }
             }
             '>' => in_tag = false,
             '&' if !in_tag => {
@@ -92,23 +93,26 @@ fn starts_html_break_tag(tag: &str) -> bool {
 fn collapse_spaces(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending_space = false;
-    let mut pending_newline = false;
+    let mut pending_newlines = 0usize;
 
     for ch in text.chars() {
         if ch == '\n' {
-            pending_newline = !out.is_empty();
+            if !out.is_empty() {
+                pending_newlines = (pending_newlines + 1).min(2);
+            }
             pending_space = false;
         } else if ch.is_whitespace() {
-            pending_space = !out.is_empty() && !pending_newline;
+            pending_space = !out.is_empty() && pending_newlines == 0;
         } else {
-            if pending_newline {
+            for _ in 0..pending_newlines {
                 out.push('\n');
-            } else if pending_space {
+            }
+            if pending_newlines == 0 && pending_space {
                 out.push(' ');
             }
             out.push(ch);
             pending_space = false;
-            pending_newline = false;
+            pending_newlines = 0;
         }
     }
 
@@ -125,8 +129,7 @@ pub(crate) fn extract_first_url(text: &str) -> Option<String> {
 }
 
 pub(crate) fn clean_comment_text(text: &str) -> String {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines = normalized
+    let mut lines = text
         .lines()
         .filter(|line| !line.trim_start().starts_with("```"))
         .map(|line| line.replace('`', ""))

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crossterm::event::{self, KeyCode, KeyEvent};
+use ratatui::crossterm::event::{self, KeyCode, KeyEvent};
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::app::App;
@@ -34,6 +34,14 @@ fn test_comment(author: &str, depth: usize, text: &str) -> Comment {
     }
 }
 
+fn line_texts(lines: &[CommentLine]) -> Vec<&str> {
+    lines.iter().map(|(line, _)| line.as_str()).collect()
+}
+
+fn line_owners(lines: &[CommentLine]) -> Vec<Option<usize>> {
+    lines.iter().map(|(_, owner)| *owner).collect()
+}
+
 #[test]
 fn extract_first_url_trims_common_trailing_punctuation() {
     assert_eq!(
@@ -61,7 +69,7 @@ fn link_spans_underlines_urls() {
 fn html_to_text_preserves_basic_breaks_and_entities() {
     assert_eq!(
         html_to_text("AT&T <p>one&nbsp;&amp;&#x27;</p><p>two</p>"),
-        "AT&T\none &'\ntwo"
+        "AT&T\n\none &'\n\ntwo"
     );
 }
 
@@ -96,7 +104,7 @@ fn parse_hn_comments_html_reads_depth_author_text_and_url() {
     assert!(
         comments[0]
             .text
-            .contains("hello https://example.com/full/path?x=1&y=2\nsecond paragraph")
+            .contains("hello https://example.com/full/path?x=1&y=2\n\nsecond paragraph")
     );
     assert_eq!(comments[1].author, "bob");
     assert_eq!(comments[1].depth, 2);
@@ -212,12 +220,23 @@ fn child_comment_starts_without_detached_separator() {
         test_comment("child", 1, "child text"),
     ];
 
-    let (lines, owners) = comment_text_lines(&comments, &HashSet::new(), None, 80);
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
 
-    assert_eq!(lines[1], "  parent text");
-    assert_eq!(owners[1], Some(0));
-    assert_eq!(lines[2], "┌─ child");
-    assert_eq!(owners[2], Some(1));
+    assert_eq!(lines[1].0.as_str(), "  parent text");
+    assert_eq!(lines[1].1, Some(0));
+    assert_eq!(lines[2].0.as_str(), "┌─ child");
+    assert_eq!(lines[2].1, Some(1));
+}
+
+#[test]
+fn comment_text_keeps_blank_line_between_paragraphs() {
+    let comments = vec![test_comment("alice", 0, "first\n\nsecond")];
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
+
+    assert_eq!(
+        line_texts(&lines),
+        vec!["alice", "  first", "  ", "  second"]
+    );
 }
 
 #[test]
@@ -229,10 +248,10 @@ fn nested_comment_separators_keep_rails() {
         test_comment("second", 1, "second text"),
     ];
 
-    let (lines, owners) = comment_text_lines(&comments, &HashSet::new(), None, 80);
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
 
     assert_eq!(
-        lines,
+        line_texts(&lines),
         vec![
             "root",
             "  root text",
@@ -246,16 +265,16 @@ fn nested_comment_separators_keep_rails() {
             "│  second text",
         ]
     );
-    assert_eq!(owners[4], None);
-    assert_eq!(owners[7], None);
+    assert_eq!(lines[4].1, None);
+    assert_eq!(lines[7].1, None);
 }
 
 #[test]
 fn comment_lines_text_underlines_urls() {
     let comments = vec![test_comment("alice", 0, "see https://example.com/a.")];
-    let (lines, owners) = comment_text_lines(&comments, &HashSet::new(), None, 80);
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
 
-    let text = comment_lines_text(&lines, &owners, &comments, None);
+    let text = comment_lines_text(&lines, &comments, None);
     let url_span = text.lines[1]
         .spans
         .iter()
@@ -274,14 +293,14 @@ fn comment_text_wraps_long_comments_with_rails() {
         url: None,
     }];
 
-    let (lines, owners) = comment_text_lines(&comments, &HashSet::new(), None, 8);
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 8);
 
     assert_eq!(
-        owners,
+        line_owners(&lines),
         vec![Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]
     );
     assert_eq!(
-        lines,
+        line_texts(&lines),
         vec![
             "┌─ alice",
             "│  one",
@@ -301,20 +320,24 @@ fn comment_text_strips_code_fence_backticks() {
         "before\n```rust\nlet x = `value`;\n```\nafter",
     )];
 
-    let (lines, _) = comment_text_lines(&comments, &HashSet::new(), None, 80);
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
 
-    assert!(lines.iter().any(|line| line.contains("let x = value;")));
-    assert!(!lines.iter().any(|line| line.contains("```")));
-    assert!(!lines.iter().any(|line| line.contains('`')));
+    assert!(
+        lines
+            .iter()
+            .any(|(line, _)| line.contains("let x = value;"))
+    );
+    assert!(!lines.iter().any(|(line, _)| line.contains("```")));
+    assert!(!lines.iter().any(|(line, _)| line.contains('`')));
 }
 
 #[test]
 fn selected_comment_is_marked() {
     let comments = vec![test_comment("alice", 0, "hello")];
 
-    let (lines, _) = comment_text_lines(&comments, &HashSet::new(), Some(0), 80);
+    let lines = comment_text_lines(&comments, &HashSet::new(), Some(0), 80);
 
-    assert!(lines[0].starts_with("▶ alice"));
+    assert!(lines[0].0.starts_with("▶ alice"));
 }
 
 #[test]
@@ -327,18 +350,18 @@ fn collapsed_comment_hides_descendants() {
     ];
     let collapsed = HashSet::from([0]);
 
-    let (lines, owners) = comment_text_lines(&comments, &collapsed, None, 80);
+    let lines = comment_text_lines(&comments, &collapsed, None, 80);
 
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("2 replies collapsed"))
+            .any(|(line, _)| line.contains("2 replies collapsed"))
     );
-    assert!(!lines.iter().any(|line| line.contains("root text")));
-    assert!(lines.iter().any(|line| line.contains("sibling")));
-    assert!(!lines.iter().any(|line| line.contains("child")));
-    assert!(owners.contains(&Some(0)));
-    assert!(owners.contains(&Some(3)));
+    assert!(!lines.iter().any(|(line, _)| line.contains("root text")));
+    assert!(lines.iter().any(|(line, _)| line.contains("sibling")));
+    assert!(!lines.iter().any(|(line, _)| line.contains("child")));
+    assert!(lines.iter().any(|(_, owner)| *owner == Some(0)));
+    assert!(lines.iter().any(|(_, owner)| *owner == Some(3)));
 }
 
 #[test]
@@ -364,13 +387,13 @@ fn toggle_comment_collapse_tracks_selected_tree() {
     assert!(app.collapsed_comments.contains(&2));
     assert_eq!(app.status, "Collapsed comment");
 
-    let (lines, _) = comment_text_lines(&app.comments, &app.collapsed_comments, None, 80);
+    let lines = comment_text_lines(&app.comments, &app.collapsed_comments, None, 80);
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("sibling [collapsed]"))
+            .any(|(line, _)| line.contains("sibling [collapsed]"))
     );
-    assert!(!lines.iter().any(|line| line.contains("sibling text")));
+    assert!(!lines.iter().any(|(line, _)| line.contains("sibling text")));
 }
 
 #[test]
@@ -394,22 +417,23 @@ fn left_right_select_visible_comments() {
 
 #[test]
 fn selecting_comment_scrolls_until_whole_comment_is_visible() {
-    let owners = vec![
-        Some(0),
-        Some(0),
-        None,
-        Some(1),
-        Some(1),
-        Some(1),
-        None,
-        Some(2),
-    ];
+    let lines = [
+        ("", Some(0)),
+        ("", Some(0)),
+        ("", None),
+        ("", Some(1)),
+        ("", Some(1)),
+        ("", Some(1)),
+        ("", None),
+        ("", Some(2)),
+    ]
+    .map(|(line, owner)| (line.to_string(), owner));
 
-    assert_eq!(owner_line_range(&owners, 1), Some((3, 5)));
-    assert_eq!(scroll_to_show_comment(&owners, 1, 0, 4, 4), 2);
-    assert_eq!(scroll_to_show_comment(&owners, 1, 4, 4, 4), 3);
-    assert_eq!(scroll_to_show_comment(&owners, 0, 3, 4, 4), 0);
-    assert_eq!(scroll_to_show_comment(&owners, 1, 0, 2, 6), 3);
+    assert_eq!(owner_line_range(&lines, 1), Some((3, 5)));
+    assert_eq!(scroll_to_show_comment(&lines, 1, 0, 4, 4), 2);
+    assert_eq!(scroll_to_show_comment(&lines, 1, 4, 4, 4), 3);
+    assert_eq!(scroll_to_show_comment(&lines, 0, 3, 4, 4), 0);
+    assert_eq!(scroll_to_show_comment(&lines, 1, 0, 2, 6), 3);
 }
 
 #[test]

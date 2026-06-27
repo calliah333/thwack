@@ -1,6 +1,6 @@
 use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
 use crate::app::App;
 use crate::model::{Mode, Source};
@@ -9,13 +9,11 @@ use crate::ui::render;
 pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|frame| render(frame, app))?;
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if handle_key(app, key) {
-                    break Ok(());
-                }
-            }
-            _ => {}
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if handle_key(app, key) {
+            break Ok(());
         }
     }
 }
@@ -38,7 +36,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('g') => app.move_top(),
         KeyCode::Char('G') => app.move_bottom(),
         KeyCode::Char('o') => app.open_selected_link(),
-        KeyCode::Char('c') => app.open_discussion(),
+        KeyCode::Char('c') => {
+            let url = app.selected_post().map(|post| post.discussion_url.clone());
+            app.open_url(url);
+        }
         KeyCode::Char('r') => match app.mode {
             Mode::Posts => app.refresh(),
             Mode::Comments => app.load_comments(),
@@ -58,7 +59,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 _ => {}
             },
             Mode::Comments => match key.code {
-                KeyCode::Esc | KeyCode::Char('b') => app.back_to_posts(),
+                KeyCode::Esc | KeyCode::Char('b') => app.mode = Mode::Posts,
                 KeyCode::Left | KeyCode::Char('h') => app.select_previous_comment(),
                 KeyCode::Right | KeyCode::Char('l') => app.select_next_comment(),
                 KeyCode::Char(' ') | KeyCode::Enter => app.toggle_comment_collapse(),
