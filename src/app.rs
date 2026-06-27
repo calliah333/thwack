@@ -1,4 +1,8 @@
-use std::{collections::HashSet, io, process::Command};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    process::Command,
+};
 
 use crate::fetch::{fetch_comments, fetch_posts};
 use crate::model::{Comment, Mode, Post, Source, source_label};
@@ -10,6 +14,7 @@ pub(crate) struct App {
     pub(crate) source: Source,
     pub(crate) mode: Mode,
     pub(crate) posts: Vec<Post>,
+    pub(crate) post_cache: HashMap<Source, Vec<Post>>,
     pub(crate) post_selected: usize,
     pub(crate) comments: Vec<Comment>,
     pub(crate) comment_selected: usize,
@@ -27,6 +32,7 @@ impl App {
             source: Source::HackerNews,
             mode: Mode::Posts,
             posts: Vec::new(),
+            post_cache: HashMap::new(),
             post_selected: 0,
             comments: Vec::new(),
             comment_selected: 0,
@@ -39,14 +45,35 @@ impl App {
     }
 
     pub(crate) fn refresh(&mut self) {
-        let source = self.source;
+        let active_source = self.source;
+        for source in [Source::HackerNews, Source::Lobsters] {
+            match fetch_posts(&self.client, source) {
+                Ok(posts) => {
+                    self.post_cache.insert(source, posts);
+                    if source == active_source {
+                        self.show_cached_posts(source);
+                    }
+                }
+                Err(err) => {
+                    if source == active_source {
+                        self.status = format!("Error: {err}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn show_cached_posts(&mut self, source: Source) {
         let label = source_label(source);
-        match fetch_posts(&self.client, source) {
-            Ok(posts) => {
+        match self.post_cache.get(&source).cloned() {
+            Some(posts) => {
                 let count = posts.len();
                 self.set_posts(posts, format!("Loaded {count} {label} posts"));
             }
-            Err(err) => self.status = format!("Error: {err}"),
+            None => self.set_posts(
+                Vec::new(),
+                format!("No cached {label} posts; press r to refresh"),
+            ),
         }
     }
 
@@ -198,25 +225,27 @@ impl App {
         }
 
         self.source = source;
-        self.set_posts(Vec::new(), format!("Loading {}...", source_label(source)));
-        self.refresh();
+        self.show_cached_posts(source);
+    }
+
+    pub(crate) fn selected_open_url(&self) -> Option<String> {
+        match self.mode {
+            Mode::Posts => self.selected_post().and_then(|post| post.url.clone()),
+            Mode::Comments => self
+                .selected_comment()
+                .and_then(|comment| {
+                    comment
+                        .url
+                        .clone()
+                        .or_else(|| extract_first_url(&comment.text))
+                        .or_else(|| extract_first_url(&clean_comment_text(&comment.text)))
+                })
+                .or_else(|| self.selected_post().and_then(|post| post.url.clone())),
+        }
     }
 
     pub(crate) fn open_selected_link(&mut self) {
-        let url = match self.mode {
-            Mode::Posts => self
-                .selected_post()
-                .map(|post| post.url.as_ref().unwrap_or(&post.discussion_url).clone()),
-            Mode::Comments => self.selected_comment().and_then(|comment| {
-                comment
-                    .url
-                    .clone()
-                    .or_else(|| extract_first_url(&clean_comment_text(&comment.text)))
-                    .or_else(|| self.selected_post().map(|post| post.discussion_url.clone()))
-            }),
-        };
-
-        self.open_url(url);
+        self.open_url(self.selected_open_url());
     }
 
     pub(crate) fn open_url(&mut self, url: Option<String>) {

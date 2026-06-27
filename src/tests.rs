@@ -1,13 +1,16 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, num::NonZeroU16};
 
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
 
 use crate::app::App;
-use crate::fetch::parse_hn_comments_html;
+use crate::fetch::{hn_story_url, parse_hn_comments_html};
 use crate::input::handle_key;
 use crate::model::{Comment, Mode, Post, Source};
-use crate::text::{extract_first_url, html_to_text};
+use crate::text::{clean_comment_text, extract_first_url, html_to_text};
 use crate::ui::*;
 
 fn test_post(source: Source, id: &str) -> Post {
@@ -35,11 +38,11 @@ fn test_comment(author: &str, depth: usize, text: &str) -> Comment {
 }
 
 fn line_texts(lines: &[CommentLine]) -> Vec<&str> {
-    lines.iter().map(|(line, _)| line.as_str()).collect()
+    lines.iter().map(|line| line.text.as_str()).collect()
 }
 
 fn line_owners(lines: &[CommentLine]) -> Vec<Option<usize>> {
-    lines.iter().map(|(_, owner)| *owner).collect()
+    lines.iter().map(|line| line.owner).collect()
 }
 
 #[test]
@@ -47,6 +50,10 @@ fn extract_first_url_trims_common_trailing_punctuation() {
     assert_eq!(
         extract_first_url("see (https://example.com/a)."),
         Some("https://example.com/a".to_string())
+    );
+    assert_eq!(
+        extract_first_url("see [docs](https://example.com/docs)."),
+        Some("https://example.com/docs".to_string())
     );
     assert_eq!(extract_first_url("none"), None);
 }
@@ -66,10 +73,73 @@ fn link_spans_underlines_urls() {
 }
 
 #[test]
+fn apply_hyperlinks_wraps_underlined_urls_in_osc8() {
+    let url = "https://example.com/a";
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
+    let line = Line::from(link_spans(
+        &format!("see ({url})."),
+        Style::default().fg(Color::Gray),
+    ));
+    buffer.set_line(0, 0, &line, 40);
+
+    apply_hyperlinks(&mut buffer);
+
+    let expected = format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\");
+    let width = NonZeroU16::new(url.len() as u16).expect("url is not empty");
+    let cell = buffer.cell((5, 0)).expect("link cell");
+    assert_eq!(cell.symbol(), expected.as_str());
+    assert_eq!(cell.diff_option, CellDiffOption::ForcedWidth(width));
+    assert_eq!(
+        buffer
+            .cell((5 + url.len() as u16, 0))
+            .expect("trailing punctuation")
+            .symbol(),
+        ")"
+    );
+}
+
+#[test]
 fn html_to_text_preserves_basic_breaks_and_entities() {
     assert_eq!(
         html_to_text("AT&T <p>one&nbsp;&amp;&#x27;</p><p>two</p>"),
         "AT&T\n\none &'\n\ntwo"
+    );
+}
+
+#[test]
+fn clean_comment_text_formats_lobsters_markdown_links_and_keeps_quotes() {
+    assert_eq!(
+        clean_comment_text("see [docs](https://example.com/docs).\n> first\n> second"),
+        "see docs.\n> first\n> second"
+    );
+}
+
+#[test]
+fn comment_markdown_links_render_label_as_osc8() {
+    let url = "https://example.com/docs";
+    let comments = vec![test_comment("alice", 0, &format!("see [docs]({url})."))];
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
+    let text = comment_lines_text(&lines, &comments, None);
+    let link_span = text.lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content == "docs")
+        .expect("markdown link span");
+
+    assert_eq!(line_texts(&lines)[0], "alice: see docs.");
+    assert!(link_span.style.add_modifier.contains(Modifier::UNDERLINED));
+
+    let area = Rect::new(0, 0, 40, 3);
+    let mut buffer = Buffer::empty(area);
+    buffer.set_line(1, 1, &text.lines[0], 38);
+    apply_comment_hyperlinks(&mut buffer, area, &lines, 0);
+
+    let expected = format!("\x1b]8;;{url}\x1b\\docs\x1b]8;;\x1b\\");
+    let cell = buffer.cell((12, 1)).expect("markdown link cell");
+    assert_eq!(cell.symbol(), expected.as_str());
+    assert_eq!(
+        cell.diff_option,
+        CellDiffOption::ForcedWidth(NonZeroU16::new(4).expect("docs has width"))
     );
 }
 
@@ -117,6 +187,21 @@ fn parse_hn_comments_html_returns_empty_for_no_comments() {
 }
 
 #[test]
+fn hn_story_url_drops_discussion_links() {
+    assert_eq!(
+        hn_story_url(
+            Some("https://news.ycombinator.com/item?id=1".to_string()),
+            1
+        ),
+        None
+    );
+    assert_eq!(hn_story_url(Some("item?id=1".to_string()), 1), None);
+    assert_eq!(
+        hn_story_url(Some("https://example.com/post".to_string()), 1).as_deref(),
+        Some("https://example.com/post")
+    );
+}
+#[test]
 fn post_header_text_includes_colored_metadata_lines() {
     let mut post = test_post(Source::HackerNews, "1");
     post.text = Some("summary".to_string());
@@ -130,6 +215,51 @@ fn post_header_text_includes_colored_metadata_lines() {
             .add_modifier
             .contains(Modifier::UNDERLINED)
     );
+    assert_eq!(text.lines[1].spans[7].content, "1");
+    assert!(
+        !text
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.content.contains("discussion:"))
+    );
+}
+
+#[test]
+fn post_open_url_uses_story_url_not_discussion() {
+    let mut app = App::new(reqwest::blocking::Client::new());
+    let mut post = test_post(Source::HackerNews, "1");
+    post.url = Some("https://article.example".to_string());
+    post.discussion_url = "https://news.ycombinator.com/item?id=1".to_string();
+    app.posts = vec![post];
+
+    assert_eq!(
+        app.selected_open_url().as_deref(),
+        Some("https://article.example")
+    );
+
+    app.posts[0].url = None;
+    app.open_selected_link();
+    assert_eq!(app.status, "No link selected");
+}
+
+#[test]
+fn comment_open_url_uses_story_url_not_discussion() {
+    let mut app = App::new(reqwest::blocking::Client::new());
+    let mut post = test_post(Source::HackerNews, "1");
+    post.url = Some("https://article.example".to_string());
+    post.discussion_url = "https://news.ycombinator.com/item?id=1".to_string();
+    app.posts = vec![post];
+    app.comments = vec![test_comment("alice", 0, "no links here")];
+    app.mode = Mode::Comments;
+
+    assert_eq!(
+        app.selected_open_url().as_deref(),
+        Some("https://article.example")
+    );
+
+    app.posts[0].url = None;
+    assert_eq!(app.selected_open_url(), None);
 }
 
 #[test]
@@ -191,26 +321,74 @@ fn switching_sources_resets_selection_and_comments() {
 }
 
 #[test]
-fn comment_prefix_makes_nested_comments_visible() {
+fn switching_sources_uses_cached_post_index() {
+    let mut app = App::new(reqwest::blocking::Client::new());
+    app.post_cache.insert(
+        Source::HackerNews,
+        vec![test_post(Source::HackerNews, "hn")],
+    );
+    app.post_cache
+        .insert(Source::Lobsters, vec![test_post(Source::Lobsters, "lob")]);
+    app.posts = app
+        .post_cache
+        .get(&Source::HackerNews)
+        .cloned()
+        .expect("cached Hacker News posts");
+    app.comments = vec![test_comment("alice", 0, "comment")];
+    app.mode = Mode::Comments;
+    app.comment_scroll = 1;
+    app.collapsed_comments.insert(0);
+
+    app.switch_source(Source::Lobsters);
+
+    assert_eq!(app.source, Source::Lobsters);
+    assert_eq!(app.posts.len(), 1);
+    assert_eq!(app.posts[0].id, "lob");
+    assert!(app.comments.is_empty());
+    assert_eq!(app.comment_scroll, 0);
+    assert!(app.collapsed_comments.is_empty());
+    assert_eq!(app.mode, Mode::Posts);
+    assert_eq!(app.status, "Loaded 1 Lobsters posts");
+}
+
+#[test]
+fn comment_prefix_uses_last_child_connectors() {
+    let comments = vec![
+        test_comment("root", 0, "root text"),
+        test_comment("first", 1, "first text"),
+        test_comment("child", 2, "child text"),
+        test_comment("second", 1, "second text"),
+        test_comment("tail", 2, "tail text"),
+    ];
+    let visible = visible_comment_indices(&comments, &HashSet::new());
+
     assert_eq!(
-        comment_prefix_for(0, false),
+        comment_prefix_for(&comments, &visible, 0),
         ("".to_string(), "  ".to_string())
     );
     assert_eq!(
-        comment_prefix_for(1, false),
+        comment_prefix_for(&comments, &visible, 1),
         ("├─ ".to_string(), "│  ".to_string())
     );
     assert_eq!(
-        comment_prefix_for(2, false),
-        ("│  ├─ ".to_string(), "│  │  ".to_string())
+        comment_prefix_for(&comments, &visible, 2),
+        ("│  └─ ".to_string(), "│     ".to_string())
+    );
+    assert_eq!(
+        comment_prefix_for(&comments, &visible, 3),
+        ("└─ ".to_string(), "   ".to_string())
+    );
+    assert_eq!(
+        comment_prefix_for(&comments, &visible, 4),
+        ("   └─ ".to_string(), "      ".to_string())
     );
 }
 
 #[test]
 fn selected_comment_prefix_keeps_nested_rails_aligned() {
-    assert_eq!(selected_comment_prefix(0), "▶ ");
-    assert_eq!(selected_comment_prefix(1), "▶─ ");
-    assert_eq!(selected_comment_prefix(2), "│  ▶─ ");
+    assert_eq!(selected_comment_prefix("", 0), "▶ ");
+    assert_eq!(selected_comment_prefix("├─ ", 1), "▶─ ");
+    assert_eq!(selected_comment_prefix("   └─ ", 2), "   ▶─ ");
 }
 
 #[test]
@@ -222,10 +400,11 @@ fn child_comment_starts_without_detached_separator() {
 
     let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
 
-    assert_eq!(lines[1].0.as_str(), "  parent text");
-    assert_eq!(lines[1].1, Some(0));
-    assert_eq!(lines[2].0.as_str(), "┌─ child");
-    assert_eq!(lines[2].1, Some(1));
+    assert_eq!(
+        line_texts(&lines),
+        vec!["parent: parent text", "│  ", "└─ child: child text", "   "]
+    );
+    assert_eq!(line_owners(&lines), vec![Some(0), None, Some(1), None]);
 }
 
 #[test]
@@ -235,7 +414,7 @@ fn comment_text_keeps_blank_line_between_paragraphs() {
 
     assert_eq!(
         line_texts(&lines),
-        vec!["alice", "  first", "  ", "  second"]
+        vec!["alice: first", "  ", "  second", "  "]
     );
 }
 
@@ -246,6 +425,7 @@ fn nested_comment_separators_keep_rails() {
         test_comment("first", 1, "first text"),
         test_comment("child", 2, "child text"),
         test_comment("second", 1, "second text"),
+        test_comment("next", 0, "next text"),
     ];
 
     let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
@@ -253,29 +433,34 @@ fn nested_comment_separators_keep_rails() {
     assert_eq!(
         line_texts(&lines),
         vec![
-            "root",
-            "  root text",
-            "┌─ first",
-            "│  first text",
+            "root: root text",
             "│  ",
-            "│  ┌─ child",
-            "│  │  child text",
-            "│  ",
-            "├─ second",
-            "│  second text",
+            "├─ first: first text",
+            "│  │  ",
+            "│  └─ child: child text",
+            "│     ",
+            "└─ second: second text",
+            "   ",
+            "next: next text",
+            "  ",
         ]
     );
-    assert_eq!(lines[4].1, None);
-    assert_eq!(lines[7].1, None);
+    assert!(
+        lines
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .all(|line| line.owner.is_none())
+    );
 }
 
 #[test]
 fn comment_lines_text_underlines_urls() {
     let comments = vec![test_comment("alice", 0, "see https://example.com/a.")];
     let lines = comment_text_lines(&comments, &HashSet::new(), None, 80);
-
     let text = comment_lines_text(&lines, &comments, None);
-    let url_span = text.lines[1]
+
+    let url_span = text.lines[0]
         .spans
         .iter()
         .find(|span| span.content == "https://example.com/a")
@@ -293,22 +478,12 @@ fn comment_text_wraps_long_comments_with_rails() {
         url: None,
     }];
 
-    let lines = comment_text_lines(&comments, &HashSet::new(), None, 8);
+    let lines = comment_text_lines(&comments, &HashSet::new(), None, 14);
 
-    assert_eq!(
-        line_owners(&lines),
-        vec![Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]
-    );
+    assert_eq!(line_owners(&lines), vec![Some(0), Some(0), Some(0), None]);
     assert_eq!(
         line_texts(&lines),
-        vec![
-            "┌─ alice",
-            "│  one",
-            "│  two",
-            "│  three",
-            "│  four",
-            "│  five"
-        ]
+        vec!["└─ alice: one", "   two three", "   four five", "   "]
     );
 }
 
@@ -325,10 +500,10 @@ fn comment_text_strips_code_fence_backticks() {
     assert!(
         lines
             .iter()
-            .any(|(line, _)| line.contains("let x = value;"))
+            .any(|line| line.text.contains("let x = value;"))
     );
-    assert!(!lines.iter().any(|(line, _)| line.contains("```")));
-    assert!(!lines.iter().any(|(line, _)| line.contains('`')));
+    assert!(!lines.iter().any(|line| line.text.contains("```")));
+    assert!(!lines.iter().any(|line| line.text.contains('`')));
 }
 
 #[test]
@@ -337,7 +512,33 @@ fn selected_comment_is_marked() {
 
     let lines = comment_text_lines(&comments, &HashSet::new(), Some(0), 80);
 
-    assert!(lines[0].0.starts_with("▶ alice"));
+    assert!(lines[0].text.starts_with("▶ alice"));
+}
+
+#[test]
+fn selected_comment_only_highlights_username() {
+    let comments = vec![test_comment("alice", 0, "hello")];
+    let lines = comment_text_lines(&comments, &HashSet::new(), Some(0), 80);
+    let text = comment_lines_text(&lines, &comments, Some(0));
+    let spans = &text.lines[0].spans;
+    let yellow = Some(Color::Yellow);
+
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["▶ ", "alice", ": hello"]
+    );
+    assert_eq!(spans[1].style.fg, yellow);
+    assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+    assert!(
+        spans
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 1)
+            .all(|(_, span)| span.style.fg != yellow)
+    );
 }
 
 #[test]
@@ -355,13 +556,13 @@ fn collapsed_comment_hides_descendants() {
     assert!(
         lines
             .iter()
-            .any(|(line, _)| line.contains("2 replies collapsed"))
+            .any(|line| line.text.contains("2 replies collapsed"))
     );
-    assert!(!lines.iter().any(|(line, _)| line.contains("root text")));
-    assert!(lines.iter().any(|(line, _)| line.contains("sibling")));
-    assert!(!lines.iter().any(|(line, _)| line.contains("child")));
-    assert!(lines.iter().any(|(_, owner)| *owner == Some(0)));
-    assert!(lines.iter().any(|(_, owner)| *owner == Some(3)));
+    assert!(!lines.iter().any(|line| line.text.contains("root text")));
+    assert!(lines.iter().any(|line| line.text.contains("sibling")));
+    assert!(!lines.iter().any(|line| line.text.contains("child")));
+    assert!(lines.iter().any(|line| line.owner == Some(0)));
+    assert!(lines.iter().any(|line| line.owner == Some(3)));
 }
 
 #[test]
@@ -391,9 +592,9 @@ fn toggle_comment_collapse_tracks_selected_tree() {
     assert!(
         lines
             .iter()
-            .any(|(line, _)| line.contains("sibling [collapsed]"))
+            .any(|line| line.text.contains("sibling [collapsed]"))
     );
-    assert!(!lines.iter().any(|(line, _)| line.contains("sibling text")));
+    assert!(!lines.iter().any(|line| line.text.contains("sibling text")));
 }
 
 #[test]
@@ -427,7 +628,11 @@ fn selecting_comment_scrolls_until_whole_comment_is_visible() {
         ("", None),
         ("", Some(2)),
     ]
-    .map(|(line, owner)| (line.to_string(), owner));
+    .map(|(line, owner)| CommentLine {
+        text: line.to_string(),
+        owner,
+        links: Vec::new(),
+    });
 
     assert_eq!(owner_line_range(&lines, 1), Some((3, 5)));
     assert_eq!(scroll_to_show_comment(&lines, 1, 0, 4, 4), 2);
@@ -505,4 +710,42 @@ fn rendering_empty_comments_does_not_panic() {
     terminal
         .draw(|frame| render(frame, &mut app))
         .expect("draw empty comments");
+}
+
+#[test]
+fn comment_header_height_matches_header_text() {
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    let mut app = App::new(reqwest::blocking::Client::new());
+    app.mode = Mode::Comments;
+    app.posts = vec![test_post(Source::HackerNews, "1")];
+
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("draw comments");
+
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(0, 5)].symbol(), "└");
+    assert_eq!(buffer[(0, 6)].symbol(), "┌");
+}
+
+#[test]
+fn comment_header_height_counts_wrapped_title() {
+    let backend = ratatui::backend::TestBackend::new(50, 20);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    let mut app = App::new(reqwest::blocking::Client::new());
+    let mut post = test_post(Source::HackerNews, "1");
+    post.title = "0123456789 0123456789 0123456789 0123456789 0123456789".to_string();
+    app.mode = Mode::Comments;
+    app.posts = vec![post];
+
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("draw comments");
+
+    let buffer = terminal.backend().buffer();
+    let url_line = (0..50).map(|x| buffer[(x, 5)].symbol()).collect::<String>();
+    assert!(url_line.contains("url:"));
+    assert_eq!(buffer[(0, 6)].symbol(), "└");
+    assert_eq!(buffer[(0, 7)].symbol(), "┌");
 }

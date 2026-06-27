@@ -97,7 +97,7 @@ fn fetch_hn_posts(client: &reqwest::blocking::Client) -> Result<Vec<Post>> {
             .as_deref()
             .map(html_to_text)
             .filter(|text| !text.is_empty());
-        let url = item.url.filter(|url| !url.trim().is_empty());
+        let url = hn_story_url(item.url, item.id);
         posts.push(Post {
             source: Source::HackerNews,
             id: item.id.to_string(),
@@ -125,6 +125,28 @@ fn fetch_hn_item(client: &reqwest::blocking::Client, id: u64) -> Result<Option<H
         .with_context(|| format!("HTTP status for {url}"))?
         .json()
         .with_context(|| format!("decode JSON from {url}"))
+}
+
+pub(crate) fn hn_story_url(url: Option<String>, id: u64) -> Option<String> {
+    let url = url?;
+    let url = url.trim();
+    if url.is_empty() || is_hn_discussion_url(url, id) {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+fn is_hn_discussion_url(url: &str, id: u64) -> bool {
+    let path = url
+        .strip_prefix("https://news.ycombinator.com/")
+        .or_else(|| url.strip_prefix("http://news.ycombinator.com/"))
+        .unwrap_or(url);
+    let item = format!("item?id={id}");
+    let Some(rest) = path.strip_prefix(&item) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('&') || rest.starts_with('#')
 }
 
 fn fetch_hn_comments(client: &reqwest::blocking::Client, post: &Post) -> Result<Vec<Comment>> {

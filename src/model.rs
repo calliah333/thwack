@@ -10,7 +10,7 @@ pub(crate) enum Mode {
     Comments,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Post {
     pub(crate) source: Source,
     pub(crate) id: String,
