@@ -6,8 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 crossterm = "0.29"
-html2text = "0.17"
 ratatui = "0.30"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
-webbrowser = "1"

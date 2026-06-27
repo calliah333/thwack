@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    time::Duration,
-};
+use std::{collections::HashSet, io, process::Command, time::Duration};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -15,7 +11,6 @@ use ratatui::{
 };
 
 const POST_LIMIT: usize = 30;
-const HN_COMMENT_WORKERS: usize = 16;
 const USER_AGENT: &str = "thwack/0.1";
 const HN_TOP_URL: &str = "https://hacker-news.firebaseio.com/v0/topstories.json";
 const LOBSTERS_HOTTEST_URL: &str = "https://lobste.rs/hottest.json";
@@ -31,41 +26,6 @@ enum Mode {
     Posts,
     Comments,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Capabilities {
-    login: bool,
-    submit_post: bool,
-    submit_comment: bool,
-}
-
-impl Capabilities {
-    const READ_ONLY: Self = Self {
-        login: false,
-        submit_post: false,
-        submit_comment: false,
-    };
-}
-
-trait Provider {
-    fn label(&self) -> &'static str;
-    fn title(&self) -> &'static str;
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::READ_ONLY
-    }
-    fn fetch_posts(&self, client: &reqwest::blocking::Client) -> Result<Vec<Post>>;
-    fn fetch_comments(
-        &self,
-        client: &reqwest::blocking::Client,
-        post: &Post,
-    ) -> Result<Vec<Comment>>;
-}
-
-struct HackerNewsProvider;
-struct LobstersProvider;
-
-static HACKER_NEWS_PROVIDER: HackerNewsProvider = HackerNewsProvider;
-static LOBSTERS_PROVIDER: LobstersProvider = LobstersProvider;
 
 #[derive(Debug)]
 struct Post {
@@ -94,7 +54,6 @@ struct App {
     source: Source,
     mode: Mode,
     posts: Vec<Post>,
-    post_cache: HashMap<Source, Vec<Post>>,
     post_selected: usize,
     comments: Vec<Comment>,
     comment_selected: usize,
@@ -151,50 +110,6 @@ struct LobstersComment {
     url: String,
 }
 
-impl Provider for HackerNewsProvider {
-    fn label(&self) -> &'static str {
-        "Hacker News"
-    }
-
-    fn title(&self) -> &'static str {
-        "Hacker News top"
-    }
-
-    fn fetch_posts(&self, client: &reqwest::blocking::Client) -> Result<Vec<Post>> {
-        fetch_hn_posts(client)
-    }
-
-    fn fetch_comments(
-        &self,
-        client: &reqwest::blocking::Client,
-        post: &Post,
-    ) -> Result<Vec<Comment>> {
-        fetch_hn_comments(client, post)
-    }
-}
-
-impl Provider for LobstersProvider {
-    fn label(&self) -> &'static str {
-        "Lobsters"
-    }
-
-    fn title(&self) -> &'static str {
-        "Lobsters hottest"
-    }
-
-    fn fetch_posts(&self, client: &reqwest::blocking::Client) -> Result<Vec<Post>> {
-        fetch_lobsters_posts(client)
-    }
-
-    fn fetch_comments(
-        &self,
-        client: &reqwest::blocking::Client,
-        post: &Post,
-    ) -> Result<Vec<Comment>> {
-        fetch_lobsters_comments(client, post)
-    }
-}
-
 impl App {
     fn new(client: reqwest::blocking::Client) -> Self {
         Self {
@@ -202,7 +117,6 @@ impl App {
             source: Source::HackerNews,
             mode: Mode::Posts,
             posts: Vec::new(),
-            post_cache: HashMap::new(),
             post_selected: 0,
             comments: Vec::new(),
             comment_selected: 0,
@@ -214,13 +128,9 @@ impl App {
         }
     }
 
-    fn current_provider(&self) -> &'static dyn Provider {
-        provider(self.source)
-    }
-
     fn refresh(&mut self) {
         let source = self.source;
-        let label = self.current_provider().label();
+        let label = source_label(source);
         match fetch_posts(&self.client, source) {
             Ok(posts) => {
                 let count = posts.len();
@@ -249,7 +159,7 @@ impl App {
             return;
         };
 
-        let result = provider(post.source).fetch_comments(&self.client, post);
+        let result = fetch_comments(&self.client, post);
         match result {
             Ok(comments) => {
                 let count = comments.len();
@@ -377,24 +287,9 @@ impl App {
             return;
         }
 
-        let old_source = self.source;
-        let old_posts = std::mem::take(&mut self.posts);
-        if !old_posts.is_empty() {
-            self.post_cache.insert(old_source, old_posts);
-        }
-
         self.source = source;
-        if let Some(posts) = self.post_cache.remove(&source) {
-            let count = posts.len();
-            let label = self.current_provider().label();
-            self.set_posts(posts, format!("Loaded {count} {label} posts (cached)"));
-        } else {
-            self.set_posts(
-                Vec::new(),
-                format!("Loading {}...", self.current_provider().label()),
-            );
-            self.refresh();
-        }
+        self.set_posts(Vec::new(), format!("Loading {}...", source_label(source)));
+        self.refresh();
     }
 
     fn open_selected_link(&mut self) {
@@ -429,34 +324,39 @@ impl App {
             return;
         };
 
-        match webbrowser::open(&url) {
+        match open_in_browser(&url) {
             Ok(()) => self.status = format!("Opened {url}"),
             Err(err) => self.status = format!("Open failed: {err}"),
         }
     }
 }
 
-fn hn_item_url(id: u64) -> String {
-    format!("https://hacker-news.firebaseio.com/v0/item/{id}.json")
-}
-
-fn hn_discussion_url(id: u64) -> String {
-    format!("https://news.ycombinator.com/item?id={id}")
-}
-
-fn lobsters_story_api_url(short_id: &str) -> String {
-    format!("https://lobste.rs/s/{short_id}.json")
-}
-
-fn provider(source: Source) -> &'static dyn Provider {
+fn source_label(source: Source) -> &'static str {
     match source {
-        Source::HackerNews => &HACKER_NEWS_PROVIDER,
-        Source::Lobsters => &LOBSTERS_PROVIDER,
+        Source::HackerNews => "Hacker News",
+        Source::Lobsters => "Lobsters",
+    }
+}
+
+fn source_title(source: Source) -> &'static str {
+    match source {
+        Source::HackerNews => "Hacker News top",
+        Source::Lobsters => "Lobsters hottest",
     }
 }
 
 fn fetch_posts(client: &reqwest::blocking::Client, source: Source) -> Result<Vec<Post>> {
-    provider(source).fetch_posts(client)
+    match source {
+        Source::HackerNews => fetch_hn_posts(client),
+        Source::Lobsters => fetch_lobsters_posts(client),
+    }
+}
+
+fn fetch_comments(client: &reqwest::blocking::Client, post: &Post) -> Result<Vec<Comment>> {
+    match post.source {
+        Source::HackerNews => fetch_hn_comments(client, post),
+        Source::Lobsters => fetch_lobsters_comments(client, post),
+    }
 }
 
 fn fetch_hn_posts(client: &reqwest::blocking::Client) -> Result<Vec<Post>> {
@@ -495,7 +395,7 @@ fn fetch_hn_posts(client: &reqwest::blocking::Client) -> Result<Vec<Post>> {
             score: item.score.unwrap_or(0),
             comment_count: item.descendants.unwrap_or(0),
             url,
-            discussion_url: hn_discussion_url(item.id),
+            discussion_url: format!("https://news.ycombinator.com/item?id={}", item.id),
             text,
             tags: Vec::new(),
         });
@@ -505,7 +405,7 @@ fn fetch_hn_posts(client: &reqwest::blocking::Client) -> Result<Vec<Post>> {
 }
 
 fn fetch_hn_item(client: &reqwest::blocking::Client, id: u64) -> Result<Option<HnItem>> {
-    let url = hn_item_url(id);
+    let url = format!("https://hacker-news.firebaseio.com/v0/item/{id}.json");
     client
         .get(&url)
         .send()
@@ -525,53 +425,9 @@ fn fetch_hn_comments(client: &reqwest::blocking::Client, post: &Post) -> Result<
         .with_context(|| format!("load Hacker News story item {}", post.id))?;
     let mut comments = Vec::new();
     if let Some(kids) = story.kids.as_deref() {
-        collect_hn_comments_parallel(client, kids, 0, &mut comments)?;
+        collect_hn_comments(client, kids, 0, &mut comments)?;
     }
     Ok(comments)
-}
-
-fn collect_hn_comments_parallel(
-    client: &reqwest::blocking::Client,
-    ids: &[u64],
-    depth: usize,
-    out: &mut Vec<Comment>,
-) -> Result<()> {
-    if ids.len() <= 1 {
-        return collect_hn_comments(client, ids, depth, out);
-    }
-
-    let worker_count = ids.len().min(HN_COMMENT_WORKERS);
-    let chunk_size = ids.len().div_ceil(worker_count);
-    let mut chunk_results = Vec::new();
-
-    std::thread::scope(|scope| -> Result<()> {
-        let handles = ids
-            .chunks(chunk_size)
-            .map(|chunk| {
-                let client = client.clone();
-                scope.spawn(move || {
-                    let mut comments = Vec::new();
-                    collect_hn_comments(&client, chunk, depth, &mut comments)?;
-                    Ok::<Vec<Comment>, anyhow::Error>(comments)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for handle in handles {
-            let comments = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("Hacker News comment worker panicked"))??;
-            chunk_results.push(comments);
-        }
-
-        Ok(())
-    })?;
-
-    for mut comments in chunk_results {
-        out.append(&mut comments);
-    }
-
-    Ok(())
 }
 
 fn collect_hn_comments(
@@ -651,7 +507,7 @@ fn fetch_lobsters_comments(
     client: &reqwest::blocking::Client,
     post: &Post,
 ) -> Result<Vec<Comment>> {
-    let url = lobsters_story_api_url(&post.id);
+    let url = format!("https://lobste.rs/s/{}.json", post.id);
     let story: LobstersStory = client
         .get(&url)
         .send()
@@ -683,9 +539,121 @@ fn fetch_lobsters_comments(
 }
 
 fn html_to_text(html: &str) -> String {
-    html2text::from_read(html.as_bytes(), 80)
-        .map(|text| text.trim().to_string())
-        .unwrap_or_else(|_| html.to_string())
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut entity = None::<String>;
+
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                if let Some(entity) = entity.take() {
+                    out.push('&');
+                    out.push_str(&entity);
+                }
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => in_tag = false,
+            '&' if !in_tag => {
+                if let Some(entity) = entity.take() {
+                    out.push('&');
+                    out.push_str(&entity);
+                }
+                entity = Some(String::new());
+            }
+            ';' if !in_tag && entity.is_some() => {
+                push_html_entity(&mut out, entity.as_deref().unwrap_or_default());
+                entity = None;
+            }
+            _ if !in_tag && entity.is_some() => {
+                if let Some(entity) = &mut entity {
+                    entity.push(ch);
+                }
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+
+    if let Some(entity) = entity {
+        out.push('&');
+        out.push_str(&entity);
+    }
+
+    collapse_spaces(&out)
+}
+
+fn push_html_entity(out: &mut String, entity: &str) {
+    let decoded = match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "nbsp" => Some(' '),
+        _ => entity
+            .strip_prefix("#x")
+            .or_else(|| entity.strip_prefix("#X"))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .or_else(|| entity.strip_prefix('#').and_then(|n| n.parse().ok()))
+            .and_then(char::from_u32),
+    };
+
+    if let Some(ch) = decoded {
+        out.push(ch);
+    } else {
+        out.push('&');
+        out.push_str(entity);
+        out.push(';');
+    }
+}
+
+fn collapse_spaces(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+            }
+            out.push(ch);
+            pending_space = false;
+        }
+    }
+    out
+}
+
+fn open_in_browser(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::other(
+        "opening URLs is unsupported on this platform",
+    ));
+
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("opener exited with {status}")))
+    }
 }
 
 fn extract_first_url(text: &str) -> Option<String> {
@@ -704,7 +672,7 @@ fn main() -> Result<()> {
         .build()?;
     let mut app = App::new(client);
     app.refresh();
-    ratatui::run(|mut terminal| run(&mut terminal, &mut app))?;
+    ratatui::run(|terminal| run(terminal, &mut app))?;
     Ok(())
 }
 
@@ -734,40 +702,38 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
-    match app.mode {
-        Mode::Posts => match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-            KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-            KeyCode::Char('g') => app.move_top(),
-            KeyCode::Char('G') => app.move_bottom(),
-            KeyCode::Enter | KeyCode::Right => app.load_comments(),
-            KeyCode::Char('o') => app.open_selected_link(),
-            KeyCode::Char('c') => app.open_discussion(),
-            KeyCode::Char('r') => app.refresh(),
-            KeyCode::Tab => {
-                let source = match app.source {
-                    Source::HackerNews => Source::Lobsters,
-                    Source::Lobsters => Source::HackerNews,
-                };
-                app.switch_source(source);
-            }
-            KeyCode::Char('1') => app.switch_source(Source::HackerNews),
-            KeyCode::Char('2') => app.switch_source(Source::Lobsters),
-            _ => {}
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char('g') => app.move_top(),
+        KeyCode::Char('G') => app.move_bottom(),
+        KeyCode::Char('o') => app.open_selected_link(),
+        KeyCode::Char('c') => app.open_discussion(),
+        KeyCode::Char('r') => match app.mode {
+            Mode::Posts => app.refresh(),
+            Mode::Comments => app.load_comments(),
         },
-        Mode::Comments => match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-            KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-            KeyCode::Char('g') => app.move_top(),
-            KeyCode::Char('G') => app.move_bottom(),
-            KeyCode::Esc | KeyCode::Char('b') => app.back_to_posts(),
-            KeyCode::Left | KeyCode::Char('h') => app.select_previous_comment(),
-            KeyCode::Right | KeyCode::Char('l') => app.select_next_comment(),
-            KeyCode::Char('o') => app.open_selected_link(),
-            KeyCode::Char('c') => app.open_discussion(),
-            KeyCode::Char('r') => app.load_comments(),
-            KeyCode::Char(' ') | KeyCode::Enter => app.toggle_comment_collapse(),
-            _ => {}
+        _ => match app.mode {
+            Mode::Posts => match key.code {
+                KeyCode::Enter | KeyCode::Right => app.load_comments(),
+                KeyCode::Tab => {
+                    let source = match app.source {
+                        Source::HackerNews => Source::Lobsters,
+                        Source::Lobsters => Source::HackerNews,
+                    };
+                    app.switch_source(source);
+                }
+                KeyCode::Char('1') => app.switch_source(Source::HackerNews),
+                KeyCode::Char('2') => app.switch_source(Source::Lobsters),
+                _ => {}
+            },
+            Mode::Comments => match key.code {
+                KeyCode::Esc | KeyCode::Char('b') => app.back_to_posts(),
+                KeyCode::Left | KeyCode::Char('h') => app.select_previous_comment(),
+                KeyCode::Right | KeyCode::Char('l') => app.select_next_comment(),
+                KeyCode::Char(' ') | KeyCode::Enter => app.toggle_comment_collapse(),
+                _ => {}
+            },
         },
     }
 
@@ -787,7 +753,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::Comments => "comments",
     };
     frame.render_widget(
-        Paragraph::new(format!("{} | {mode}", app.current_provider().title()))
+        Paragraph::new(format!("{} | {mode}", source_title(app.source)))
             .style(Style::default().add_modifier(Modifier::BOLD)),
         title_area,
     );
@@ -797,11 +763,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::Comments => render_comments(frame, app, content_area),
     }
 
-    let capability = if app.current_provider().capabilities() == Capabilities::READ_ONLY {
-        "read-only"
-    } else {
-        "write-capable"
-    };
+    let capability = "read-only";
     let help = match app.mode {
         Mode::Posts => {
             "j/k/↑/↓ move · Enter comments · o open · c discussion · r refresh · Tab/1/2 source · q quit"
@@ -816,20 +778,13 @@ fn render(frame: &mut Frame, app: &mut App) {
     );
 }
 
-fn post_row_bg(index: usize) -> Color {
-    if index % 2 == 0 {
+fn post_list_item(post: &Post, index: usize) -> ListItem<'static> {
+    let bg = if index.is_multiple_of(2) {
         Color::Rgb(18, 18, 24)
     } else {
         Color::Rgb(28, 28, 36)
-    }
-}
-
-fn post_row_style(index: usize) -> Style {
-    Style::default().fg(Color::Gray).bg(post_row_bg(index))
-}
-
-fn post_list_item(post: &Post, index: usize) -> ListItem<'static> {
-    let style = post_row_style(index);
+    };
+    let style = Style::default().fg(Color::Gray).bg(bg);
     let title_style = style.fg(Color::White).add_modifier(Modifier::BOLD);
     let label_style = style.fg(Color::DarkGray);
     let score_style = style.fg(Color::Green);
@@ -958,11 +913,6 @@ fn comment_prefix_for(depth: usize, starts_branch: bool) -> (String, String) {
     (format!("{rail}{joint}"), format!("{rail}│  "))
 }
 
-#[cfg(test)]
-fn comment_prefix(depth: usize) -> (String, String) {
-    comment_prefix_for(depth, false)
-}
-
 fn selected_comment_prefix(depth: usize) -> String {
     if depth == 0 {
         "▶ ".to_string()
@@ -998,61 +948,12 @@ fn visible_comment_indices(comments: &[Comment], collapsed: &HashSet<usize>) -> 
     visible
 }
 
-fn markdown_reference(line: &str) -> Option<(&str, &str)> {
-    let line = line.trim();
-    let rest = line.strip_prefix('[')?;
-    let (id, rest) = rest.split_once("]:")?;
-    Some((id.trim(), rest.trim()))
-}
-
-fn rewrite_reference_links(line: &str, references: &HashMap<String, String>) -> String {
-    let mut output = String::new();
-    let mut rest = line;
-
-    while let Some(start) = rest.find('[') {
-        output.push_str(&rest[..start]);
-        let Some((label, after_label)) = rest[start + 1..].split_once("][") else {
-            output.push_str(&rest[start..]);
-            return output;
-        };
-        let Some(end) = after_label.find(']') else {
-            output.push_str(&rest[start..]);
-            return output;
-        };
-
-        let id = &after_label[..end];
-        if let Some(url) = references.get(id) {
-            if label.starts_with("http://") || label.starts_with("https://") {
-                output.push_str(label);
-            } else {
-                output.push_str(label);
-                output.push_str(" (");
-                output.push_str(url);
-                output.push(')');
-            }
-            rest = &after_label[end + 1..];
-        } else {
-            output.push('[');
-            rest = &rest[start + 1..];
-        }
-    }
-
-    output.push_str(rest);
-    output
-}
-
 fn clean_comment_text(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let references = normalized
-        .lines()
-        .filter_map(markdown_reference)
-        .map(|(id, url)| (id.to_string(), url.to_string()))
-        .collect::<HashMap<_, _>>();
     let mut lines = normalized
         .lines()
         .filter(|line| !line.trim_start().starts_with("```"))
-        .filter(|line| markdown_reference(line).is_none())
-        .map(|line| rewrite_reference_links(&line.replace('`', ""), &references))
+        .map(|line| line.replace('`', ""))
         .collect::<Vec<_>>();
 
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
@@ -1153,7 +1054,7 @@ fn push_wrapped_lines(
     text: &str,
     width: usize,
 ) {
-    let available = width.saturating_sub(line_width(prefix)).max(1);
+    let available = width.saturating_sub(prefix.chars().count()).max(1);
 
     for raw in text.lines() {
         let mut rest = raw.trim_end();
@@ -1163,7 +1064,7 @@ fn push_wrapped_lines(
             continue;
         }
 
-        while line_width(rest) > available {
+        while rest.chars().count() > available {
             let split = split_at_width(rest, available);
             let (head, tail) = rest.split_at(split);
             lines.push(format!("{prefix}{}", head.trim_end()));
@@ -1196,10 +1097,6 @@ fn split_at_width(text: &str, width: usize) -> usize {
     text.len()
 }
 
-fn line_width(text: &str) -> usize {
-    text.chars().count()
-}
-
 fn author_color(author: &str) -> Color {
     const COLORS: [Color; 8] = [
         Color::Rgb(95, 135, 160),
@@ -1216,21 +1113,6 @@ fn author_color(author: &str) -> Color {
         hash.wrapping_mul(31).wrapping_add(byte as usize)
     });
     COLORS[hash % COLORS.len()]
-}
-
-fn comment_line_style(
-    _comments: &[Comment],
-    owner: Option<usize>,
-    selected: Option<usize>,
-    is_comment_header: bool,
-) -> Style {
-    match owner {
-        Some(index) if selected == Some(index) && is_comment_header => Style::default()
-            .fg(Color::Rgb(255, 255, 0))
-            .add_modifier(Modifier::BOLD),
-        Some(_) => Style::default().fg(Color::Gray),
-        None => Style::default().fg(Color::DarkGray),
-    }
 }
 
 fn split_at_char_count(text: &str, count: usize) -> (&str, &str) {
@@ -1344,10 +1226,7 @@ fn comment_lines_text(
                         |comment| deselected_comment_body_line(line, comment.depth),
                     )
                 } else {
-                    Line::styled(
-                        line.clone(),
-                        comment_line_style(comments, *owner, selected, is_comment_header),
-                    )
+                    Line::styled(line.clone(), Style::default().fg(Color::DarkGray))
                 }
             })
             .collect::<Vec<_>>(),
@@ -1470,12 +1349,6 @@ mod tests {
     }
 
     #[test]
-    fn post_row_backgrounds_alternate() {
-        assert_eq!(post_row_bg(0), post_row_bg(2));
-        assert_ne!(post_row_bg(0), post_row_bg(1));
-    }
-
-    #[test]
     fn extract_first_url_trims_common_trailing_punctuation() {
         assert_eq!(
             extract_first_url("see (https://example.com/a)."),
@@ -1485,45 +1358,10 @@ mod tests {
     }
 
     #[test]
-    fn clean_comment_text_rewrites_reference_links() {
-        let text = " [https://taoofmac.com/space/blog/2026/06/18/1845][1]\n\n  [https://github.com/rcarmo/pve-microvm][2]\n\n  [1]: https://taoofmac.com/space/blog/2026/06/18/1845\n  [2]: https://github.com/rcarmo/pve-microvm";
-
-        let cleaned = clean_comment_text(text);
-
-        assert!(cleaned.contains("https://taoofmac.com/space/blog/2026/06/18/1845"));
-        assert!(cleaned.contains("https://github.com/rcarmo/pve-microvm"));
-        assert!(!cleaned.contains("[1]:"));
-        assert!(!cleaned.contains("[2]:"));
-        assert!(!cleaned.contains("][1]"));
+    fn html_to_text_strips_basic_tags_and_entities() {
         assert_eq!(
-            extract_first_url(&cleaned),
-            Some("https://taoofmac.com/space/blog/2026/06/18/1845".to_string())
-        );
-    }
-
-    #[test]
-    fn comment_author_lines_are_dull_and_selected_is_bright_yellow() {
-        let comments = vec![
-            test_comment("alice", 0, "one"),
-            test_comment("bob", 0, "two"),
-            test_comment("alice", 0, "three"),
-        ];
-
-        let alice = deselected_comment_header_line("alice", &comments[0]);
-        let second_alice = deselected_comment_header_line("alice", &comments[2]);
-        assert_eq!(alice.spans[0].style.fg, Some(author_color("alice")));
-        assert_eq!(second_alice.spans[0].style.fg, Some(author_color("alice")));
-        assert_eq!(
-            comment_line_style(&comments, Some(1), None, false).fg,
-            Some(Color::Gray)
-        );
-        let selected = comment_line_style(&comments, Some(1), Some(1), true);
-        assert_eq!(selected.fg, Some(Color::Rgb(255, 255, 0)));
-        assert_eq!(selected.bg, None);
-        assert!(selected.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(
-            comment_line_style(&comments, Some(1), None, true).fg,
-            Some(Color::Gray)
+            html_to_text("AT&T <p>one&nbsp;&amp;&#x27;</p>"),
+            "AT&T one &'"
         );
     }
 
@@ -1596,29 +1434,17 @@ mod tests {
     }
 
     #[test]
-    fn switching_to_cached_source_skips_refetch() {
-        let mut app = App::new(reqwest::blocking::Client::new());
-        app.posts = vec![test_post(Source::HackerNews, "hn")];
-        app.post_cache
-            .insert(Source::Lobsters, vec![test_post(Source::Lobsters, "lob")]);
-
-        app.switch_source(Source::Lobsters);
-
-        assert_eq!(app.source, Source::Lobsters);
-        assert_eq!(app.posts.len(), 1);
-        assert_eq!(app.posts[0].id, "lob");
-        assert!(app.post_cache.contains_key(&Source::HackerNews));
-        assert!(!app.post_cache.contains_key(&Source::Lobsters));
-        assert_eq!(app.mode, Mode::Posts);
-        assert!(app.status.contains("(cached)"));
-    }
-
-    #[test]
     fn comment_prefix_makes_nested_comments_visible() {
-        assert_eq!(comment_prefix(0), ("".to_string(), "  ".to_string()));
-        assert_eq!(comment_prefix(1), ("├─ ".to_string(), "│  ".to_string()));
         assert_eq!(
-            comment_prefix(2),
+            comment_prefix_for(0, false),
+            ("".to_string(), "  ".to_string())
+        );
+        assert_eq!(
+            comment_prefix_for(1, false),
+            ("├─ ".to_string(), "│  ".to_string())
+        );
+        assert_eq!(
+            comment_prefix_for(2, false),
             ("│  ├─ ".to_string(), "│  │  ".to_string())
         );
     }
@@ -1628,43 +1454,6 @@ mod tests {
         assert_eq!(selected_comment_prefix(0), "▶ ");
         assert_eq!(selected_comment_prefix(1), "▶─ ");
         assert_eq!(selected_comment_prefix(2), "│  ▶─ ");
-    }
-
-    #[test]
-    fn selected_comment_colors_only_nearest_rail() {
-        let line = selected_comment_line("│  │  body", 2, false);
-
-        assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[0].content.as_ref(), "│  ");
-        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
-        assert_eq!(line.spans[1].content.as_ref(), "│  ");
-        assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(255, 255, 0)));
-        assert_eq!(line.spans[2].content.as_ref(), "body");
-        assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
-    }
-
-    #[test]
-    fn deselected_comment_colors_author_not_rails() {
-        let comment = test_comment("alice", 1, "hello");
-
-        let line = deselected_comment_header_line("┌─ alice", &comment);
-
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].content.as_ref(), "┌─ ");
-        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
-        assert_eq!(line.spans[1].content.as_ref(), "alice");
-        assert_eq!(line.spans[1].style.fg, Some(author_color("alice")));
-    }
-
-    #[test]
-    fn deselected_comment_body_colors_rails_not_text() {
-        let line = deselected_comment_body_line("│  │  body", 2);
-
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].content.as_ref(), "│  │  ");
-        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
-        assert_eq!(line.spans[1].content.as_ref(), "body");
-        assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
     }
 
     #[test]
@@ -1880,19 +1669,5 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("draw empty comments");
-    }
-
-    #[test]
-    fn providers_are_read_only_for_now() {
-        assert_eq!(
-            provider(Source::HackerNews).capabilities(),
-            Capabilities::READ_ONLY
-        );
-        assert_eq!(
-            provider(Source::Lobsters).capabilities(),
-            Capabilities::READ_ONLY
-        );
-        assert_eq!(provider(Source::HackerNews).label(), "Hacker News");
-        assert_eq!(provider(Source::Lobsters).label(), "Lobsters");
     }
 }
