@@ -417,6 +417,30 @@ fn fetch_hn_item(client: &reqwest::blocking::Client, id: u64) -> Result<Option<H
 }
 
 fn fetch_hn_comments(client: &reqwest::blocking::Client, post: &Post) -> Result<Vec<Comment>> {
+    match fetch_hn_comments_html(client, post) {
+        Ok(comments) if !comments.is_empty() || post.comment_count == 0 => Ok(comments),
+        _ => fetch_hn_comments_firebase(client, post),
+    }
+}
+
+fn fetch_hn_comments_html(client: &reqwest::blocking::Client, post: &Post) -> Result<Vec<Comment>> {
+    let url = format!("https://news.ycombinator.com/item?id={}", post.id);
+    let html = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP status for {url}"))?
+        .text()
+        .with_context(|| format!("read HTML from {url}"))?;
+
+    Ok(parse_hn_comments_html(&html))
+}
+
+fn fetch_hn_comments_firebase(
+    client: &reqwest::blocking::Client,
+    post: &Post,
+) -> Result<Vec<Comment>> {
     let id = post
         .id
         .parse::<u64>()
@@ -428,6 +452,88 @@ fn fetch_hn_comments(client: &reqwest::blocking::Client, post: &Post) -> Result<
         collect_hn_comments(client, kids, 0, &mut comments)?;
     }
     Ok(comments)
+}
+
+fn parse_hn_comments_html(html: &str) -> Vec<Comment> {
+    let mut comments = Vec::new();
+    let mut rest = html;
+
+    while let Some(start) = find_hn_comment_start(rest) {
+        rest = &rest[start..];
+        let next = find_hn_comment_start(&rest[1..])
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        let chunk = &rest[..next];
+
+        if let Some(comment) = parse_hn_comment_chunk(chunk) {
+            comments.push(comment);
+        }
+
+        rest = &rest[next..];
+    }
+
+    comments
+}
+
+fn find_hn_comment_start(html: &str) -> Option<usize> {
+    html.find("class=\"athing comtr\"")
+        .or_else(|| html.find("class='athing comtr'"))
+        .and_then(|class_pos| html[..class_pos].rfind("<tr").or(Some(class_pos)))
+}
+
+fn parse_hn_comment_chunk(chunk: &str) -> Option<Comment> {
+    let depth = parse_usize_attr(chunk, "indent").unwrap_or(0);
+    let author = find_hn_user(chunk).unwrap_or_else(|| "unknown".to_string());
+    let text = clean_comment_text(&html_to_text(find_hn_commtext_html(chunk)?));
+
+    if text.is_empty() {
+        return None;
+    }
+
+    let url = extract_first_url(&text);
+    Some(Comment {
+        author,
+        depth,
+        text,
+        url,
+    })
+}
+
+fn find_attr_value<'a>(html: &'a str, attr: &str) -> Option<&'a str> {
+    let start = html.find(attr)? + attr.len();
+    let value = html[start..].strip_prefix('=')?;
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value = &value[quote.len_utf8()..];
+    Some(&value[..value.find(quote)?])
+}
+
+fn find_hn_user(chunk: &str) -> Option<String> {
+    let class_pos = chunk
+        .find("class=\"hnuser\"")
+        .or_else(|| chunk.find("class='hnuser'"))?;
+    let anchor_start = chunk[..class_pos].rfind("<a").unwrap_or(class_pos);
+    let text = &chunk[anchor_start..];
+    let text = &text[text.find('>')? + 1..];
+    let author = html_to_text(&text[..text.find("</a>")?]);
+
+    (!author.is_empty()).then_some(author)
+}
+
+fn find_hn_commtext_html(chunk: &str) -> Option<&str> {
+    let start = chunk
+        .find("<div class=\"commtext")
+        .or_else(|| chunk.find("<div class='commtext"))?;
+    let html = &chunk[start..];
+    let html = &html[html.find('>')? + 1..];
+
+    Some(&html[..html.find("</div>")?])
+}
+
+fn parse_usize_attr(html: &str, attr: &str) -> Option<usize> {
+    find_attr_value(html, attr)?.parse().ok()
 }
 
 fn collect_hn_comments(
@@ -665,6 +771,51 @@ fn extract_first_url(text: &str) -> Option<String> {
     })
 }
 
+fn link_style() -> Style {
+    Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+fn link_spans(text: &str, plain_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = find_url_start(rest) {
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), plain_style));
+        }
+
+        let tail = &rest[start..];
+        let token_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let token = &tail[..token_end];
+        let url = token.trim_end_matches(|ch: char| ".,);]}>\"'".contains(ch));
+        if !url.is_empty() {
+            spans.push(Span::styled(url.to_string(), link_style()));
+        }
+        if url.len() < token.len() {
+            spans.push(Span::styled(token[url.len()..].to_string(), plain_style));
+        }
+
+        rest = &tail[token_end..];
+    }
+
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), plain_style));
+    }
+
+    spans
+}
+
+fn find_url_start(text: &str) -> Option<usize> {
+    match (text.find("http://"), text.find("https://")) {
+        (Some(http), Some(https)) => Some(http.min(https)),
+        (Some(http), None) => Some(http),
+        (None, Some(https)) => Some(https),
+        (None, None) => None,
+    }
+}
+
 fn main() -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
@@ -790,7 +941,7 @@ fn post_list_item(post: &Post, index: usize) -> ListItem<'static> {
     let score_style = style.fg(Color::Green);
     let comments_style = style.fg(Color::Cyan);
     let author_style = style.fg(Color::Yellow);
-    let link_style = style.fg(Color::LightBlue);
+    let link_style = link_style().bg(bg);
     let tag_style = style.fg(Color::Magenta);
     let link = post.url.as_deref().unwrap_or(&post.discussion_url);
 
@@ -847,14 +998,11 @@ fn post_header_text(post: Option<&Post>) -> Text<'static> {
         ]),
         Line::from(vec![
             Span::styled("url: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(link.to_string(), Style::default().fg(Color::LightBlue)),
+            Span::styled(link.to_string(), link_style()),
         ]),
         Line::from(vec![
             Span::styled("discussion: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                post.discussion_url.clone(),
-                Style::default().fg(Color::LightBlue),
-            ),
+            Span::styled(post.discussion_url.clone(), link_style()),
         ]),
     ];
 
@@ -862,12 +1010,10 @@ fn post_header_text(post: Option<&Post>) -> Text<'static> {
         let text = clean_comment_text(text);
         if !text.is_empty() {
             lines.push(Line::from(""));
-            lines.extend(text.lines().map(|line| {
-                Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::Gray),
-                ))
-            }));
+            lines.extend(
+                text.lines()
+                    .map(|line| Line::from(link_spans(line, Style::default().fg(Color::Gray)))),
+            );
         }
     }
 
@@ -1144,14 +1290,15 @@ fn deselected_comment_header_line(line: &str, comment: &Comment) -> Line<'static
 
 fn deselected_comment_body_line(line: &str, depth: usize) -> Line<'static> {
     let (prefix, body) = split_at_char_count(line, if depth == 0 { 2 } else { depth * 3 });
-    if prefix.is_empty() {
-        return Line::styled(body.to_string(), Style::default().fg(Color::Gray));
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
-
-    Line::from(vec![
-        Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-        Span::styled(body.to_string(), Style::default().fg(Color::Gray)),
-    ])
+    spans.extend(link_spans(body, Style::default().fg(Color::Gray)));
+    Line::from(spans)
 }
 
 fn selected_comment_line(line: &str, depth: usize, is_comment_header: bool) -> Line<'static> {
@@ -1188,12 +1335,12 @@ fn selected_comment_line(line: &str, depth: usize, is_comment_header: bool) -> L
                 spans.push(Span::styled(ancestor, ancestor_style));
             }
             spans.push(Span::styled(closest.to_string(), selected_style));
-            spans.push(Span::styled(rest.to_string(), text_style));
+            spans.extend(link_spans(rest, text_style));
             return Line::from(spans);
         }
     }
 
-    Line::styled(line.to_string(), text_style)
+    Line::from(link_spans(line, text_style))
 }
 
 fn comment_lines_text(
@@ -1358,11 +1505,59 @@ mod tests {
     }
 
     #[test]
+    fn link_spans_underlines_urls() {
+        let spans = link_spans(
+            "see (https://example.com/a).",
+            Style::default().fg(Color::Gray),
+        );
+
+        assert_eq!(spans[0].content, "see (");
+        assert_eq!(spans[1].content, "https://example.com/a");
+        assert!(spans[1].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(spans[2].content, ").");
+        assert!(!spans[2].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
     fn html_to_text_strips_basic_tags_and_entities() {
         assert_eq!(
             html_to_text("AT&T <p>one&nbsp;&amp;&#x27;</p>"),
             "AT&T one &'"
         );
+    }
+
+    #[test]
+    fn parse_hn_comments_html_reads_depth_author_text_and_url() {
+        let html = r#"
+          <table class="comment-tree">
+            <tr class="athing comtr" id="1"><td><table><tr>
+              <td class="ind" indent="0"><img width="0"></td>
+              <td class="default"><span class="comhead"><a class="hnuser">alice</a></span>
+              <div class="comment"><div class="commtext c00">hello <a href="https:&#x2F;&#x2F;example.com" rel="nofollow">https:&#x2F;&#x2F;example.com</a></div></div></td>
+            </tr></table></td></tr>
+            <tr class='athing comtr' id="2"><td><table><tr>
+              <td class="ind" indent='2'><img width="80"></td>
+              <td class="default"><span class="comhead"><a class='hnuser'>bob</a></span>
+              <div class="comment"><div class='commtext c00'>reply &amp; more</div></div></td>
+            </tr></table></td></tr>
+          </table>
+        "#;
+
+        let comments = parse_hn_comments_html(html);
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].author, "alice");
+        assert_eq!(comments[0].depth, 0);
+        assert!(comments[0].text.contains("hello"));
+        assert_eq!(comments[0].url.as_deref(), Some("https://example.com"));
+        assert_eq!(comments[1].author, "bob");
+        assert_eq!(comments[1].depth, 2);
+        assert!(comments[1].text.contains("reply & more"));
+    }
+
+    #[test]
+    fn parse_hn_comments_html_returns_empty_for_no_comments() {
+        assert!(parse_hn_comments_html("<html></html>").is_empty());
     }
 
     #[test]
@@ -1373,6 +1568,12 @@ mod tests {
         let text = post_header_text(Some(&post));
 
         assert!(text.lines.len() >= 5);
+        assert!(
+            text.lines[2].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
     }
 
     #[test]
@@ -1469,6 +1670,21 @@ mod tests {
         assert_eq!(owners[1], Some(0));
         assert_eq!(lines[2], "┌─ child");
         assert_eq!(owners[2], Some(1));
+    }
+
+    #[test]
+    fn comment_lines_text_underlines_urls() {
+        let comments = vec![test_comment("alice", 0, "see https://example.com/a.")];
+        let (lines, owners) = comment_text_lines(&comments, &HashSet::new(), None, 80);
+
+        let text = comment_lines_text(&lines, &owners, &comments, None);
+        let url_span = text.lines[1]
+            .spans
+            .iter()
+            .find(|span| span.content == "https://example.com/a")
+            .expect("url span");
+
+        assert!(url_span.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
